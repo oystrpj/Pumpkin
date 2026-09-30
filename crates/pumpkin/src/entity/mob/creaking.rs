@@ -12,6 +12,7 @@ use pumpkin_data::item::Item;
 use pumpkin_data::particle::Particle;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::tag::NbtTag;
 use pumpkin_protocol::java::client::play::CEntityStatus;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
@@ -385,23 +386,27 @@ impl CreakingEntity {
 }
 
 impl Mob for CreakingEntity {
-    fn mob_write_nbt(&self, nbt: &mut NbtCompound) {
-        if let Some(pos) = self.get_home_pos() {
-            let mut sub = NbtCompound::new();
-            sub.put_int("x", pos.0.x);
-            sub.put_int("y", pos.0.y);
-            sub.put_int("z", pos.0.z);
-            nbt.put_compound("home_pos", sub);
-        }
-    }
-
     fn mob_read_nbt(&self, nbt: &NbtCompound) {
-        if let Some(sub) = nbt.get_compound("home_pos")
-            && let (Some(x), Some(y), Some(z)) =
-                (sub.get_int("x"), sub.get_int("y"), sub.get_int("z"))
-        {
-            let pos = BlockPos::new(x, y, z);
-            self.set_transient(pos);
+        // The generic mob reader already applied vanilla's `home_pos`/`home_radius` to
+        // `position_target`; mirror that into the synced `HOME_POS`. Older Pumpkin saves wrote the
+        // same position as a `{x,y,z}` compound instead of a BlockPos list.
+        let home = match nbt.get("home_pos") {
+            Some(NbtTag::Compound(legacy)) => match (
+                legacy.get_int("x"),
+                legacy.get_int("y"),
+                legacy.get_int("z"),
+            ) {
+                (Some(x), Some(y), Some(z)) => Some(BlockPos::new(x, y, z)),
+                _ => None,
+            },
+            _ => self
+                .mob_entity
+                .has_position_target()
+                .then(|| self.mob_entity.position_target.load()),
+        };
+        match home {
+            Some(pos) => self.set_transient(pos),
+            None => self.set_home_pos(None),
         }
     }
 

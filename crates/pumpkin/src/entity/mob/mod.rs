@@ -86,7 +86,6 @@ pub struct MobEntity {
     pub look_control: std::sync::Mutex<LookControl>,
     pub sensing: std::sync::Mutex<Sensing>,
     pub move_control: std::sync::Mutex<Box<dyn MoveControlTrait>>,
-    pub brain: std::sync::Mutex<Brain>,
     pub position_target: AtomicCell<BlockPos>,
     pub position_target_range: AtomicI32,
     pub love_ticks: AtomicI32,
@@ -173,7 +172,6 @@ impl MobEntity {
             look_control: std::sync::Mutex::new(LookControl::default()),
             sensing: std::sync::Mutex::new(Sensing::default()),
             move_control: std::sync::Mutex::new(Box::new(MoveControl::default())),
-            brain: std::sync::Mutex::new(Brain::default()),
             position_target: AtomicCell::new(BlockPos::ZERO),
             position_target_range: AtomicI32::new(-1),
             love_ticks: AtomicI32::new(0),
@@ -428,7 +426,8 @@ impl MobEntity {
     pub fn tick_brain(&self, mob: &dyn Mob) {
         let world = self.living_entity.entity.world.load_full();
         let time = world.get_world_age();
-        self.brain
+        self.living_entity
+            .brain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .tick(&world, mob, time);
@@ -436,14 +435,6 @@ impl MobEntity {
 
     pub fn write_mob_nbt(&self, nbt: &mut NbtCompound) {
         self.write_drop_chances(nbt);
-        nbt.put_compound(
-            "Brain",
-            self.brain
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pack()
-                .into_nbt(),
-        );
         if self.is_no_ai() {
             nbt.put_bool("NoAI", true);
         }
@@ -456,6 +447,19 @@ impl MobEntity {
         if self.persistence_required.load(Relaxed) {
             nbt.put_bool("PersistenceRequired", true);
         }
+        // Vanilla `Mob.addAdditionalSaveData` writes the restriction only while one is set.
+        // `position_target`/`position_target_range` are Pumpkin's `homePosition`/`homeRadius`.
+        let home_radius = self.position_target_range.load(Relaxed);
+        if home_radius != -1 {
+            nbt.put_int("home_radius", home_radius);
+            let home = self.position_target.load();
+            nbt.put(
+                "home_pos",
+                pumpkin_nbt::tag::NbtTag::IntArray(vec![home.0.x, home.0.y, home.0.z]),
+            );
+        }
+        // `leash` is written by `Entity::write_leash_nbt`. `DeathLootTable` /
+        // `DeathLootTableSeed` have no generic mob state, so their vanilla keys are not written.
     }
 
     pub fn read_mob_nbt(&self, nbt: &NbtCompound) {
@@ -471,6 +475,17 @@ impl MobEntity {
         if let Some(persistence_required) = nbt.get_bool("PersistenceRequired") {
             self.persistence_required
                 .store(persistence_required, Relaxed);
+        }
+        // Vanilla `Mob.readAdditionalSaveData`: `home_radius` defaults to -1, and `home_pos` is
+        // only read when a radius was saved.
+        let home_radius = nbt.get_int("home_radius").unwrap_or(-1);
+        self.position_target_range.store(home_radius, Relaxed);
+        if home_radius >= 0 {
+            let home = match nbt.get_int_array("home_pos") {
+                Some([x, y, z]) => BlockPos::new(*x, *y, *z),
+                _ => BlockPos::ZERO,
+            };
+            self.position_target.store(home);
         }
     }
 
@@ -1526,6 +1541,10 @@ impl<T: Mob + Send + 'static> EntityBase for T {
         <T as Mob>::get_home(self)
     }
 
+    fn make_brain(&self, packed: &PackedMemories) -> Brain {
+        <T as Mob>::make_brain(self, packed)
+    }
+
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         self.get_mob_entity().write_mob_nbt(nbt);
         if let Some(ageable) = self.as_ageable() {
@@ -1541,18 +1560,11 @@ impl<T: Mob + Send + 'static> EntityBase for T {
             neutral.write_anger_nbt(nbt);
         }
         self.mob_write_nbt(nbt);
+        self.get_entity().write_leash_nbt(nbt);
     }
 
     fn read_custom_nbt(&self, nbt: &NbtCompound) {
         self.get_mob_entity().read_mob_nbt(nbt);
-        if let Some(brain) = nbt.get_compound("Brain") {
-            *self
-                .get_mob_entity()
-                .brain
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                self.make_brain(&PackedMemories::from_nbt(brain));
-        }
         if let Some(ageable) = self.as_ageable() {
             ageable.read_ageable_nbt(nbt);
         }
@@ -1566,6 +1578,7 @@ impl<T: Mob + Send + 'static> EntityBase for T {
             neutral.read_anger_nbt(nbt);
         }
         self.mob_read_nbt(nbt);
+        self.get_entity().read_leash_nbt(nbt);
     }
 
     fn get_gravity(&self) -> f64 {

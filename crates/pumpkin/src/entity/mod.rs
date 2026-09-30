@@ -7,6 +7,8 @@ use crate::{
         portal::{NetherPortal, PortalProcessor, PortalType, SourcePortalInfo},
     },
 };
+use ai::brain::Brain;
+use ai::brain::memory::PackedMemories;
 use arc_swap::ArcSwap;
 use bytes::BufMut;
 use crossbeam::atomic::AtomicCell;
@@ -146,11 +148,26 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         self.get_entity().read_nbt_non_mut(nbt);
         if let Some(living) = self.get_living_entity() {
             living.read_living_nbt_non_mut(nbt);
+            // Vanilla `LivingEntity.readAdditionalSaveData` rebuilds the brain through the
+            // virtual `makeBrain`; a player has no memories, so it stays empty.
+            if let Some(brain) = nbt.get_compound("Brain") {
+                *living
+                    .brain
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    self.make_brain(&PackedMemories::from_nbt(brain));
+            }
         }
         self.read_custom_nbt(nbt);
     }
 
     fn read_custom_nbt(&self, _nbt: &NbtCompound) {}
+
+    /// Builds this entity's brain from its saved memories (vanilla `LivingEntity.makeBrain`).
+    /// Only mobs have behaviour memories; other living entities keep the empty default.
+    fn make_brain(&self, _packed: &PackedMemories) -> Brain {
+        Brain::default()
+    }
     /// Called every tick for this entity.
     ///
     /// The `caller` parameter is a reference to the entity that initiated the tick.
@@ -836,6 +853,16 @@ struct SpawnState {
     head_yaw: u8,
 }
 
+/// A leash attachment that was read from NBT before its holder was available.
+///
+/// Vanilla keeps the same value in `Leashable.LeashData.delayedLeashInfo` and resolves it on tick.
+pub enum LeashAttachment {
+    /// Leashed to an entity (usually a player), identified by UUID.
+    Entity(Uuid),
+    /// Leashed to a fence knot at this position.
+    Knot(BlockPos),
+}
+
 /// Represents a non-living Entity (e.g. Item, Egg, Snowball...)
 pub struct Entity {
     /// A unique identifier for the entity
@@ -921,6 +948,9 @@ pub struct Entity {
     pub vehicle: std::sync::Mutex<Option<Arc<dyn EntityBase>>>,
     /// The entity this entity is attached/leashed to (if any)
     pub leashed_to: std::sync::Mutex<Option<Arc<dyn EntityBase>>>,
+    /// A leash read from NBT whose holder was not loaded yet (vanilla `LeashData.delayedLeashInfo`).
+    /// Resolved by [`Entity::tick_leash`].
+    pending_leash: std::sync::Mutex<Option<LeashAttachment>>,
     /// Cooldown before entity can mount again after dismounting
     pub riding_cooldown: AtomicI32,
     /// The age of the entity in ticks. Negative values indicate a baby.
@@ -1072,6 +1102,7 @@ impl Entity {
             passengers: std::sync::Mutex::new(Vec::new()),
             vehicle: std::sync::Mutex::new(None),
             leashed_to: std::sync::Mutex::new(None),
+            pending_leash: std::sync::Mutex::new(None),
 
             riding_cooldown: AtomicI32::new(0),
             age: AtomicI32::new(0),
@@ -3369,6 +3400,7 @@ impl Entity {
     }
 
     pub fn tick_leash(&self) {
+        self.resolve_pending_leash();
         let holder = {
             let Ok(guard) = self.leashed_to.try_lock() else {
                 return;
@@ -3444,6 +3476,89 @@ impl Entity {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
+    }
+
+    /// Writes vanilla `Leashable.writeLeashData`: `{UUID: <uuid>}` for an entity holder, or the
+    /// knot's block position for a fence knot.
+    pub fn write_leash_nbt(&self, nbt: &mut NbtCompound) {
+        let holder = self
+            .leashed_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(holder) = holder else {
+            return;
+        };
+        if let Some(knot) = holder
+            .cast_any()
+            .downcast_ref::<crate::entity::decoration::leash_knot::LeashKnotEntity>()
+        {
+            let pos = knot.block_pos();
+            nbt.put("leash", NbtTag::IntArray(vec![pos.0.x, pos.0.y, pos.0.z]));
+            return;
+        }
+        let mut leash = NbtCompound::new();
+        leash.put_uuid("UUID", holder.get_entity().entity_uuid);
+        nbt.put_compound("leash", leash);
+    }
+
+    /// Reads vanilla `Leashable.readLeashData`. The holder may not be loaded yet, so the value is
+    /// kept until [`Entity::tick_leash`] can resolve it.
+    pub fn read_leash_nbt(&self, nbt: &NbtCompound) {
+        let attachment = match nbt.get("leash") {
+            Some(NbtTag::IntArray(pos)) if pos.len() == 3 => {
+                Some(LeashAttachment::Knot(BlockPos::new(pos[0], pos[1], pos[2])))
+            }
+            Some(NbtTag::Compound(compound)) => {
+                compound.get_uuid("UUID").map(LeashAttachment::Entity)
+            }
+            _ => None,
+        };
+        if let Some(attachment) = attachment {
+            *self
+                .pending_leash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attachment);
+        }
+    }
+
+    /// Tries to attach a leash whose holder was not available when it was read
+    /// (vanilla `Leashable.restoreLeashFromSave`).
+    fn resolve_pending_leash(&self) {
+        let pending = self
+            .pending_leash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(attachment) = pending else {
+            return;
+        };
+        let world = self.world.load_full();
+        match &attachment {
+            // A knot is created if it is missing, matching vanilla's `getOrCreateKnot`.
+            LeashAttachment::Knot(pos) => {
+                let holder: Arc<dyn EntityBase> =
+                    crate::entity::decoration::leash_knot::LeashKnotEntity::get_or_create(
+                        &world, *pos,
+                    );
+                self.leash_to(holder);
+            }
+            LeashAttachment::Entity(uuid) => {
+                let holder = world
+                    .get_player_by_uuid(*uuid)
+                    .map(|player| player as Arc<dyn EntityBase>)
+                    .or_else(|| world.get_entity_by_uuid(*uuid));
+                if let Some(holder) = holder {
+                    self.leash_to(holder);
+                } else {
+                    // The holder (a mob in an unloaded chunk) may load later; retry next tick.
+                    *self
+                        .pending_leash
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attachment);
+                }
+            }
+        }
     }
 
     pub fn add_passenger(&self, vehicle: Arc<dyn EntityBase>, passenger: Arc<dyn EntityBase>) {
@@ -4017,13 +4132,30 @@ impl Entity {
             );
         }
 
+        if self.silent.load(Relaxed) {
+            nbt.put_bool("Silent", true);
+        }
+        if self.has_no_gravity() {
+            nbt.put_bool("NoGravity", true);
+        }
+        if self.glowing.load(Relaxed) {
+            nbt.put_bool("Glowing", true);
+        }
+
         let custom_data = self
             .custom_data
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !custom_data.is_empty() {
-            nbt.put_compound("PumpkinCustomData", custom_data.clone());
+            // Vanilla stores the entity's persistent container under `data` (`CustomData`).
+            // Older Pumpkin worlds wrote the same compound as `PumpkinCustomData`; the reader
+            // still accepts that and `BukkitValues` so those worlds keep loading.
+            nbt.put_compound("data", custom_data.clone());
         }
+
+        // `Passengers` is not written. A player's vehicle is persisted in the player's own NBT
+        // (`root_vehicle_uuid`) and re-paired by the tracker on load; riders of non-player
+        // vehicles are not persisted yet, so nothing here writes the key either way.
 
         // todo more...
     }
@@ -4112,8 +4244,19 @@ impl Entity {
             );
         }
 
+        if let Some(silent) = nbt.get_bool("Silent") {
+            self.set_silent(silent);
+        }
+        if let Some(no_gravity) = nbt.get_bool("NoGravity") {
+            self.set_has_no_gravity(no_gravity);
+        }
+        if let Some(glowing) = nbt.get_bool("Glowing") {
+            self.set_glowing(glowing);
+        }
+
         if let Some(custom_data) = nbt
-            .get_compound("PumpkinCustomData")
+            .get_compound("data")
+            .or_else(|| nbt.get_compound("PumpkinCustomData"))
             .or_else(|| nbt.get_compound("BukkitValues"))
         {
             let mut data = self

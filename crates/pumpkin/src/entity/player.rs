@@ -360,7 +360,7 @@ fn read_root_vehicle(nbt: &NbtCompound) -> Option<Uuid> {
     ))
 }
 
-pub const DATA_VERSION: i32 = 4903; // 26.2
+pub const DATA_VERSION: i32 = 5023; // 26.3
 
 /// Food exhaustion applied for every block a player mines.
 ///
@@ -6826,6 +6826,19 @@ impl NBTStorage for EnderChestInventory {
 
 impl NBTStorageInit for EnderChestInventory {}
 
+impl Player {
+    /// Writes vanilla `sleeping_pos`, the head position of the bed the player is sleeping in.
+    fn write_sleeping_pos(&self, nbt: &mut NbtCompound) {
+        let Some(bed_pos) = self.sleeping_bed_pos.load() else {
+            return;
+        };
+        nbt.put(
+            "sleeping_pos",
+            NbtTag::IntArray(vec![bed_pos.0.x, bed_pos.0.y, bed_pos.0.z]),
+        );
+    }
+}
+
 impl EntityBase for Player {
     fn damage_with_context(
         &self,
@@ -6975,6 +6988,7 @@ impl EntityBase for Player {
         nbt.put_int("XpSeed", self.enchantment_seed.load(Ordering::Relaxed));
         nbt.put_int("Score", self.score.load(Ordering::Relaxed));
         nbt.put_short("SleepTimer", self.sleeping_since.load().unwrap_or(0) as i16);
+        self.write_sleeping_pos(nbt);
 
         nbt.put_int("playerGameType", self.gamemode.load() as i32);
         if let Some(previous_gamemode) = self.previous_gamemode.load() {
@@ -7104,6 +7118,11 @@ impl EntityBase for Player {
             && sleep_timer > 0
         {
             self.sleeping_since.store(Some(sleep_timer as u8));
+        }
+        if let Some(pos) = nbt.get_int_array("sleeping_pos")
+            && let [x, y, z] = pos
+        {
+            self.sleeping_bed_pos.store(Some(BlockPos::new(*x, *y, *z)));
         }
 
         self.seen_credits.store(

@@ -27,6 +27,7 @@ use super::{Entity, EntityBase, NBTStorageInit};
 use crate::block::OnLandedUponArgs;
 use crate::entity::NBTStorage;
 use crate::entity::ageable::AgeableMob;
+use crate::entity::ai::brain::Brain;
 use crate::entity::attributes::AttributeInstance;
 use crate::entity::attributes::Modifier;
 use crate::entity::attributes::ModifierOperation;
@@ -76,8 +77,13 @@ use std::sync::RwLock;
 pub struct LivingEntity {
     /// The underlying entity object, providing basic entity information and functionality.
     pub entity: Entity,
-    /// Tracks the remaining time until the entity can regenerate health.
-    pub hurt_cooldown: AtomicI32,
+    /// Behaviour memories and sensors (vanilla `LivingEntity.brain`). Every living entity has one;
+    /// only mobs add memories to it.
+    pub brain: std::sync::Mutex<Brain>,
+    /// Ticks left in the damage-immunity window after being hit (vanilla `Entity.invulnerableTime`).
+    pub invulnerable_time: AtomicI32,
+    /// Ticks left of the red hurt flash (vanilla `LivingEntity.hurtTime`, byte below `hurtDuration`).
+    pub hurt_time: AtomicI32,
     /// Stores the amount of damage the entity last received.
     pub last_damage_taken: AtomicCell<f32>,
     /// The current health level of the entity.
@@ -235,6 +241,13 @@ impl LivingEntity {
         &Block::SLIME_BLOCK,
     ];
 
+    /// Ticks of damage immunity granted per accepted hit (vanilla sets `invulnerableTime = 20`).
+    const INVULNERABLE_TIME_TICKS: i32 = 20;
+    /// Length of the red hurt flash (vanilla `LivingEntity.hurtDuration`).
+    const HURT_DURATION: i32 = 10;
+    /// Ticks a hit is remembered (vanilla `setLastHurtByPlayer(player, 100)`).
+    const LAST_HURT_BY_MEMORY_TICKS: i64 = 100;
+
     fn hurt_sound_for_entity(entity_type: &'static EntityType) -> Sound {
         entity_type.hurt_sound.unwrap_or(Sound::EntityGenericHurt)
     }
@@ -281,7 +294,9 @@ impl LivingEntity {
             },
             health: AtomicCell::new(max_health), // Initial health value from attributes
             entity,
-            hurt_cooldown: AtomicI32::new(0),
+            brain: std::sync::Mutex::new(Brain::default()),
+            invulnerable_time: AtomicI32::new(0),
+            hurt_time: AtomicI32::new(0),
             last_damage_taken: AtomicCell::new(0.0),
             absorption: AtomicCell::new(0.0),
             fall_distance: AtomicCell::new(0.0),
@@ -330,7 +345,7 @@ impl LivingEntity {
         let player_id = self.last_hurt_by_player_id.load(Relaxed);
         let player_time = self.last_hurt_by_player_time.load(Relaxed);
         if player_id != 0
-            && (current_tick - player_time).abs() <= 100
+            && (current_tick - player_time).abs() <= Self::LAST_HURT_BY_MEMORY_TICKS
             && let Some(player) = world.get_entity_by_id(player_id)
         {
             return Some(player);
@@ -339,7 +354,7 @@ impl LivingEntity {
         let mob_id = self.last_hurt_by_mob_id.load(Relaxed);
         let mob_time = self.last_hurt_by_mob_time.load(Relaxed);
         if mob_id != 0
-            && (current_tick - mob_time).abs() <= 100
+            && (current_tick - mob_time).abs() <= Self::LAST_HURT_BY_MEMORY_TICKS
             && let Some(mob) = world.get_entity_by_id(mob_id)
         {
             return Some(mob);
@@ -2588,7 +2603,8 @@ impl LivingEntity {
         self.reset_effects_and_attributes();
 
         // Give a short grace period of invulnerability after respawn
-        self.hurt_cooldown.store(20, Relaxed);
+        self.invulnerable_time
+            .store(Self::INVULNERABLE_TIME_TICKS, Relaxed);
         self.last_damage_taken.store(0f32);
 
         self.entity.portal_cooldown.store(0, Relaxed);
@@ -2651,6 +2667,7 @@ impl LivingEntity {
 
 impl LivingEntity {
     pub fn write_living_nbt(&self, nbt: &mut NbtCompound) {
+        self.write_attributes_nbt(nbt);
         nbt.put("Health", NbtTag::Float(self.health.load()));
         // Avoid persisting a lethal fall distance when the entity is dead to prevent death loops
         let fall_distance = if self.dead.load(Relaxed) {
@@ -2660,10 +2677,27 @@ impl LivingEntity {
         };
         // Persist current absorption amount
         nbt.put("AbsorptionAmount", NbtTag::Float(self.absorption.load()));
-        nbt.put("FallDistance", NbtTag::Float(fall_distance));
-        nbt.put_short("HurtTime", self.hurt_cooldown.load(Relaxed).max(0) as i16);
+        // Vanilla `Entity.saveWithoutId` writes the fall distance as a double under
+        // `fall_distance`; `FallDistance` was Pumpkin's old camelCase key and is still read.
+        nbt.put_double("fall_distance", f64::from(fall_distance));
+        nbt.put_short("HurtTime", self.hurt_time.load(Relaxed).max(0) as i16);
+        let invulnerable_time = self.invulnerable_time.load(Relaxed);
+        if invulnerable_time > 0 {
+            nbt.put_int("invulnerable_time", invulnerable_time);
+        }
         nbt.put_short("DeathTime", i16::from(self.death_time.load(Relaxed)));
         nbt.put_bool("FallFlying", self.entity.is_fall_flying());
+        // Vanilla `LivingEntity.addAdditionalSaveData` always writes the packed brain, so a
+        // player (no memories) still gets `Brain: {memories: {}}`.
+        nbt.put_compound(
+            "Brain",
+            self.brain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pack()
+                .into_nbt(),
+        );
+        self.write_last_hurt_by_nbt(nbt);
         {
             let effects_vec: Vec<pumpkin_data::potion::Effect> = {
                 let effects = self
@@ -2701,9 +2735,16 @@ impl LivingEntity {
         if !equipment.child_tags.is_empty() {
             nbt.put("equipment", NbtTag::Compound(equipment));
         }
+        // `Air` only exists for players (written in the player's own NBT). `fall_distance` is
+        // tracked on living entities only, so non-living entities omit it (vanilla defaults it to
+        // 0 on read). `locator_bar_icon`, `current_impulse_context_reset_grace_time` and
+        // `current_explosion_impact_pos` have no Pumpkin state, so their vanilla keys are
+        // intentionally not written.
     }
 
     pub fn read_living_nbt_non_mut(&self, nbt: &NbtCompound) {
+        // Applied before Health so a missing `Health` falls back to the loaded max health.
+        self.read_attributes_nbt(nbt);
         // Vanilla LivingEntity.readAdditionalSaveData defaults to the mob's own max health,
         // not a flat 20; a hoglin (40 max) or iron golem (100 max) with no saved Health would
         // otherwise be silently reset to 20 here.
@@ -2736,8 +2777,10 @@ impl LivingEntity {
         // Load fall distance, but if this entity is currently marked dead ensure we don't restore
         // a lethal fall distance that would immediately re-kill on spawn.
         let fd = nbt
-            .get_float("FallDistance")
+            .get_double("fall_distance")
+            .map(|value| value as f32)
             .or_else(|| nbt.get_float("fall_distance"))
+            .or_else(|| nbt.get_float("FallDistance"))
             .unwrap_or(0.0);
         if self.dead.load(Relaxed) {
             self.fall_distance.store(0.0);
@@ -2745,8 +2788,12 @@ impl LivingEntity {
             self.fall_distance.store(fd);
         }
         if let Some(hurt_time) = nbt.get_short("HurtTime") {
-            self.hurt_cooldown.store(i32::from(hurt_time), Relaxed);
+            self.hurt_time.store(i32::from(hurt_time), Relaxed);
         }
+        if let Some(invulnerable_time) = nbt.get_int("invulnerable_time") {
+            self.invulnerable_time.store(invulnerable_time, Relaxed);
+        }
+        self.read_last_hurt_by_nbt(nbt);
         if let Some(death_time) = nbt.get_short("DeathTime") {
             self.death_time.store(death_time as u8, Relaxed);
         }
@@ -2779,6 +2826,99 @@ impl LivingEntity {
             }
         }
         // todo more...
+    }
+
+    /// Writes vanilla's packed `attributes` list (`AttributeInstance.Packed.LIST_CODEC`).
+    fn write_attributes_nbt(&self, nbt: &mut NbtCompound) {
+        let attributes = self
+            .attributes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let packed = pack_attributes(&attributes);
+        if !packed.is_empty() {
+            nbt.put_list("attributes", packed);
+        }
+    }
+
+    /// Applies vanilla's packed `attributes` list (vanilla `AttributeMap.apply`).
+    fn read_attributes_nbt(&self, nbt: &NbtCompound) {
+        let Some(packed) = nbt.get_list("attributes") else {
+            return;
+        };
+        let mut attributes = self
+            .attributes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        apply_packed_attributes(&mut attributes, packed);
+    }
+
+    /// Writes vanilla `last_hurt_by_player` / `last_hurt_by_mob`. Vanilla stores the attacker as an
+    /// `EntityReference` (UUID) plus a timer; Pumpkin keys the same state by runtime entity id and
+    /// the absolute tick, so convert here.
+    fn write_last_hurt_by_nbt(&self, nbt: &mut NbtCompound) {
+        let world = self.entity.world.load();
+        let current_tick = world.level_info.load().day_time;
+
+        let player_id = self.last_hurt_by_player_id.load(Relaxed);
+        let player_time = self.last_hurt_by_player_time.load(Relaxed);
+        if player_id != 0
+            && (current_tick - player_time).abs() <= Self::LAST_HURT_BY_MEMORY_TICKS
+            && let Some(player) = world.get_entity_by_id(player_id)
+        {
+            nbt.put_uuid("last_hurt_by_player", player.get_entity().entity_uuid);
+            nbt.put_int(
+                "last_hurt_by_player_memory_time",
+                (Self::LAST_HURT_BY_MEMORY_TICKS - (current_tick - player_time)) as i32,
+            );
+        }
+
+        let mob_id = self.last_hurt_by_mob_id.load(Relaxed);
+        let mob_time = self.last_hurt_by_mob_time.load(Relaxed);
+        if mob_id != 0
+            && (current_tick - mob_time).abs() <= Self::LAST_HURT_BY_MEMORY_TICKS
+            && let Some(mob) = world.get_entity_by_id(mob_id)
+        {
+            nbt.put_uuid("last_hurt_by_mob", mob.get_entity().entity_uuid);
+            nbt.put_int(
+                "ticks_since_last_hurt_by_mob",
+                (current_tick - mob_time) as i32,
+            );
+        }
+    }
+
+    /// Reads vanilla `last_hurt_by_player` / `last_hurt_by_mob`. The attacker is stored as a UUID,
+    /// which can only be resolved against entities that are already loaded.
+    fn read_last_hurt_by_nbt(&self, nbt: &NbtCompound) {
+        let world = self.entity.world.load();
+        let current_tick = world.level_info.load().day_time;
+
+        if let Some(uuid) = nbt.get_uuid("last_hurt_by_player")
+            && let Some(holder) = world
+                .get_player_by_uuid(uuid)
+                .map(|player| player as Arc<dyn EntityBase>)
+                .or_else(|| world.get_entity_by_uuid(uuid))
+        {
+            let memory = nbt
+                .get_int("last_hurt_by_player_memory_time")
+                .unwrap_or(0)
+                .clamp(0, Self::LAST_HURT_BY_MEMORY_TICKS as i32);
+            self.last_hurt_by_player_id
+                .store(holder.get_entity().entity_id, Relaxed);
+            self.last_hurt_by_player_time.store(
+                current_tick - (Self::LAST_HURT_BY_MEMORY_TICKS - i64::from(memory)),
+                Relaxed,
+            );
+        }
+
+        if let Some(uuid) = nbt.get_uuid("last_hurt_by_mob")
+            && let Some(holder) = world.get_entity_by_uuid(uuid)
+        {
+            let since = nbt.get_int("ticks_since_last_hurt_by_mob").unwrap_or(0);
+            self.last_hurt_by_mob_id
+                .store(holder.get_entity().entity_id, Relaxed);
+            self.last_hurt_by_mob_time
+                .store(current_tick - i64::from(since), Relaxed);
+        }
     }
 
     /// Calculates damage after armor reduction, mirroring vanilla `LivingEntity.getDamageAfterArmorAbsorb`.
@@ -3127,13 +3267,15 @@ impl LivingEntity {
         // Apply hurt cooldown logic
         let last_damage = self.last_damage_taken.load();
         let (damage_amount, play_sound) =
-            if self.hurt_cooldown.load(Relaxed) > 10 && !bypasses_cooldown_protection {
+            if self.invulnerable_time.load(Relaxed) > 10 && !bypasses_cooldown_protection {
                 if effective_amount <= last_damage {
                     return false;
                 }
                 (effective_amount - last_damage, false)
             } else {
-                self.hurt_cooldown.store(20, Relaxed);
+                self.invulnerable_time
+                    .store(Self::INVULNERABLE_TIME_TICKS, Relaxed);
+                self.hurt_time.store(Self::HURT_DURATION, Relaxed);
                 (effective_amount, self.health.load() > effective_amount)
             };
 
@@ -3569,8 +3711,11 @@ impl EntityBase for LivingEntity {
             }
         }
 
-        if self.hurt_cooldown.load(Relaxed) > 0 {
-            self.hurt_cooldown.fetch_sub(1, Relaxed);
+        if self.invulnerable_time.load(Relaxed) > 0 {
+            self.invulnerable_time.fetch_sub(1, Relaxed);
+        }
+        if self.hurt_time.load(Relaxed) > 0 {
+            self.hurt_time.fetch_sub(1, Relaxed);
         }
         if self.health.load() <= 0.0 {
             let time = self
@@ -3802,6 +3947,106 @@ fn attributes_by_id(id: u8) -> Option<&'static Attributes> {
     Attributes::ALL.iter().find(|attr| attr.id == id)
 }
 
+/// Encodes attributes in vanilla's `AttributeInstance.Packed.LIST_CODEC` shape.
+fn pack_attributes(attributes: &FxHashMap<u8, AttributeInstance>) -> Vec<NbtTag> {
+    let mut ids: Vec<u8> = attributes.keys().copied().collect();
+    // Stable order keeps the output diffable.
+    ids.sort_unstable();
+    let mut packed = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(attribute) = attributes_by_id(id) else {
+            continue;
+        };
+        let instance = &attributes[&id];
+        let mut modifiers = Vec::with_capacity(instance.modifiers.len());
+        for modifier in &instance.modifiers {
+            let mut tag = NbtCompound::new();
+            tag.put_string("id", modifier.id.clone());
+            tag.put_double("amount", modifier.amount);
+            tag.put_string("operation", operation_name(modifier.operation).to_string());
+            modifiers.push(NbtTag::Compound(tag));
+        }
+        let mut tag = NbtCompound::new();
+        tag.put_string("id", attribute.name.to_string());
+        tag.put_double("base", instance.base_value);
+        if !modifiers.is_empty() {
+            tag.put_list("modifiers", modifiers);
+        }
+        packed.push(NbtTag::Compound(tag));
+    }
+    packed
+}
+
+/// Applies a packed `attributes` list. Vanilla `AttributeMap.apply` only touches instances the
+/// entity already has, so unknown ids are skipped.
+fn apply_packed_attributes(attributes: &mut FxHashMap<u8, AttributeInstance>, packed: &[NbtTag]) {
+    for entry in packed {
+        let Some(entry) = entry.extract_compound() else {
+            continue;
+        };
+        let Some(name) = entry.get_string("id") else {
+            continue;
+        };
+        let Some(attribute) = attributes_by_name(name) else {
+            continue;
+        };
+        let Some(instance) = attributes.get_mut(&attribute.id) else {
+            continue;
+        };
+        if let Some(base) = entry.get_double("base") {
+            instance.base_value = base;
+        }
+        instance.modifiers.clear();
+        if let Some(modifiers) = entry.get_list("modifiers") {
+            for modifier in modifiers {
+                let Some(modifier) = modifier.extract_compound() else {
+                    continue;
+                };
+                let Some(id) = modifier.get_string("id") else {
+                    continue;
+                };
+                let Some(operation) = modifier
+                    .get_string("operation")
+                    .and_then(operation_from_name)
+                else {
+                    continue;
+                };
+                instance.modifiers.push(Modifier {
+                    id: id.to_string(),
+                    amount: modifier.get_double("amount").unwrap_or(0.0),
+                    operation,
+                });
+            }
+        }
+        // Force the cached effective value to be recomputed.
+        instance.dirty.store(true, Relaxed);
+    }
+}
+
+fn attributes_by_name(name: &str) -> Option<&'static Attributes> {
+    Attributes::ALL
+        .iter()
+        .find(|attr| attr.name == name || attr.name.strip_prefix("minecraft:") == Some(name))
+}
+
+/// Vanilla `AttributeModifier.Operation` name.
+const fn operation_name(operation: ModifierOperation) -> &'static str {
+    match operation {
+        ModifierOperation::Add => "add_value",
+        ModifierOperation::MultiplyBase => "add_multiplied_base",
+        ModifierOperation::MultiplyTotal => "add_multiplied_total",
+    }
+}
+
+fn operation_from_name(name: &str) -> Option<ModifierOperation> {
+    match name {
+        "add_value" => Some(ModifierOperation::Add),
+        "add_multiplied_base" => Some(ModifierOperation::MultiplyBase),
+        "add_multiplied_total" => Some(ModifierOperation::MultiplyTotal),
+        _ => None,
+    }
+}
+
 fn push_unique_attribute(touched: &mut Vec<Attributes>, attr: &Attributes) {
     if !touched.iter().any(|existing| existing.id == attr.id) {
         touched.push(attr.clone());
@@ -3916,6 +4161,42 @@ pub(crate) const fn bypasses_armor_durability(damage_type: &DamageType) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_attributes_match_vanilla_shape() {
+        let mut attributes = FxHashMap::default();
+        let mut instance = AttributeInstance::new(5.0);
+        instance.add_or_replace_modifier(Modifier {
+            id: "minecraft:test".to_string(),
+            amount: 2.0,
+            operation: ModifierOperation::Add,
+        });
+        attributes.insert(Attributes::ARMOR.id, instance);
+
+        let packed = pack_attributes(&attributes);
+        let entry = packed
+            .iter()
+            .find_map(|tag| tag.extract_compound())
+            .expect("one packed attribute");
+        assert_eq!(entry.get_string("id"), Some("minecraft:armor"));
+        assert_eq!(entry.get_double("base"), Some(5.0));
+        let modifier = entry
+            .get_list("modifiers")
+            .and_then(|list| list.first())
+            .and_then(|tag| tag.extract_compound())
+            .expect("one modifier");
+        assert_eq!(modifier.get_string("operation"), Some("add_value"));
+        assert_eq!(modifier.get_double("amount"), Some(2.0));
+
+        // Round-trip into a fresh map: base and modifier must survive.
+        let mut restored = FxHashMap::default();
+        restored.insert(Attributes::ARMOR.id, AttributeInstance::new(0.0));
+        apply_packed_attributes(&mut restored, &packed);
+        let restored = &restored[&Attributes::ARMOR.id];
+        assert!((restored.base_value - 5.0).abs() < f64::EPSILON);
+        assert_eq!(restored.modifiers.len(), 1);
+        assert!((restored.value() - 7.0).abs() < f64::EPSILON);
+    }
 
     // ── bypasses_armor_durability ─────────────────────────────────────
 
