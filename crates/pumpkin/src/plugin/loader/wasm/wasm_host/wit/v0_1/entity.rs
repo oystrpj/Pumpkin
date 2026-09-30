@@ -24,6 +24,7 @@ use crate::plugin::loader::wasm::wasm_host::{
     wit::v0_1::world::to_wasm_block_direction,
 };
 use pumpkin_data::entity::EntityPose as InternalEntityPose;
+use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
 
 impl Host for PluginHostState {}
 impl entity_types::Host for PluginHostState {}
@@ -756,6 +757,23 @@ impl HostEntity for PluginHostState {
         let entity = self.get(&this)?;
         let base_entity = entity.get_entity();
         Ok(base_entity.has_custom_data(&namespace, &key))
+    }
+
+    async fn get_nbt(&mut self, this: Resource<Entity>) -> wasmtime::Result<WitNbtTree> {
+        let entity = self.get(&this)?;
+        let mut nbt = NbtCompound::new();
+        entity.write_nbt(&mut nbt);
+        Ok(super::common::to_wit_nbt_tree(NbtTag::Compound(nbt)))
+    }
+
+    async fn set_nbt(&mut self, this: Resource<Entity>, nbt: WitNbtTree) -> wasmtime::Result<()> {
+        let entity = self.get(&this)?;
+        let tag = super::common::from_wit_nbt_tree(&nbt).map_err(wasmtime::Error::msg)?;
+        let NbtTag::Compound(compound) = tag else {
+            return Err(wasmtime::Error::msg("entity NBT must be a compound tag"));
+        };
+        entity.read_nbt_non_mut(&compound);
+        Ok(())
     }
 
     async fn as_living(

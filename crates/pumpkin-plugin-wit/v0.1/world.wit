@@ -513,6 +513,14 @@ interface %world {
         /// Returns whether this entity has a namespaced custom data value.
         has-custom-data: func(namespace: string, key: string) -> bool;
 
+        /// Serializes this entity's persistent data as NBT, the same payload written when the
+        /// world is saved. Includes position, motion, rotation and custom data.
+        get-nbt: func() -> nbt-tree;
+        /// Applies persistent data from NBT to this entity, the same payload read when the world
+        /// is loaded. The root must be a compound tag. Position, motion, rotation and custom data
+        /// are applied; the entity type and UUID are not changed.
+        set-nbt: func(nbt: nbt-tree);
+
         /// Returns this entity as a living-entity if it has health and attributes, or none otherwise.
         as-living: func() -> option<living-entity>;
 
